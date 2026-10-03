@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, doc_id INT, name TEXT, 
 CREATE TABLE IF NOT EXISTS texts(file_id INTEGER PRIMARY KEY, doc_id INT, txt TEXT);
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, doc_id INT, title TEXT, assignee INT, due TEXT, done INT DEFAULT 0, done_at TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts TEXT, uid INT, who TEXT, act TEXT, target TEXT, info TEXT, prev TEXT, h TEXT);
+CREATE TABLE IF NOT EXISTS devices(token_hash TEXT PRIMARY KEY, uid INT, at TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body);
 """
 
@@ -156,7 +157,9 @@ def docs_list(h):
     terms = re.findall(r"\w+", fold(q.get("q", "")))
     if terms: w.append("d.id IN (SELECT rowid FROM fts WHERE fts MATCH ?)"); a.append(" ".join(t + "*" for t in terms))
     sql = ("SELECT d.id,d.kind,d.reg_no,d.reg_year,d.so_kh,d.ngay_vb,d.coquan,d.trichyeu,d.level,d.urgency,d.status,"
-           "(SELECT MIN(due) FROM tasks WHERE doc_id=d.id AND done=0) due FROM docs d WHERE " + " AND ".join(w) + " ORDER BY d.id DESC LIMIT 300")
+           "(SELECT MIN(due) FROM tasks WHERE doc_id=d.id AND done=0) due, "
+           "(SELECT COUNT(*) FROM files WHERE doc_id=d.id) file_count "
+           "FROM docs d WHERE " + " AND ".join(w) + " ORDER BY d.id DESC LIMIT 300")
     if terms: audit(h.c, h.user, "search", info=" ".join(terms)[:80])
     return [dict(r) for r in h.c.execute(sql, a)]
 
@@ -259,6 +262,22 @@ def dash(h):
     stats = [dict(r) for r in c.execute("SELECT kind,status,COUNT(*) n FROM docs WHERE deleted=0 AND level<=? GROUP BY kind,status", (u["level"],))]
     return {"tasks": tasks, "stats": stats}
 
+# ---- thiết bị di động: token chỉ đọc, chỉ dùng được cho /api/reminders (không truy cập được dữ liệu khác) ----
+@route("POST", r"/api/device")
+def dev_new(h):
+    tok = secrets.token_hex(32)
+    h.c.execute("INSERT INTO devices VALUES(?,?,?)", (hashlib.sha256(tok.encode()).hexdigest(), h.user["id"], now().isoformat(timespec="seconds")))
+    audit(h.c, h.user, "device_new"); return {"token": tok}
+
+@route("GET", r"/api/reminders", None)
+def reminders(h):   # chỉ trả số lượng, không trả tiêu đề/nội dung văn bản
+    m = re.fullmatch(r"Bearer ([0-9a-f]{64})", h.headers.get("Authorization", ""))
+    u = m and h.c.execute("SELECT u.* FROM devices d JOIN users u ON u.id=d.uid WHERE d.token_hash=? AND u.active=1", (hashlib.sha256(m[1].encode()).hexdigest(),)).fetchone()
+    need(u, 401, "Thiết bị chưa được cấp quyền")
+    days = [(date.fromisoformat(r[0]) - today()).days for r in h.c.execute(
+        "SELECT t.due FROM tasks t JOIN docs d ON d.id=t.doc_id AND d.deleted=0 WHERE t.done=0 AND t.assignee=? AND d.level<=?", (u["id"], u["level"]))]
+    return {"overdue": sum(x < 0 for x in days), "today": sum(x == 0 for x in days), "soon": sum(0 < x <= 3 for x in days)}
+
 @route("GET", r"/api/dossiers")
 def dos_list(h):
     return [dict(r) for r in h.c.execute("SELECT s.id,s.code,s.title,(SELECT COUNT(*) FROM docs d WHERE d.dossier_id=s.id AND d.deleted=0 AND d.level<=?) n FROM dossiers s ORDER BY s.id DESC", (h.user["level"],))]
@@ -299,8 +318,9 @@ def users_set(h, id):
         need(len(d["pw"]) >= 10, 400, "Mật khẩu tối thiểu 10 ký tự"); salt = secrets.token_hex(16); ch["salt"], ch["pw"] = salt, hpw(d["pw"], salt)
     need(ch, 400, "Không có thay đổi")
     c.execute("UPDATE users SET " + ",".join(k + "=?" for k in ch) + " WHERE id=?", (*ch.values(), id))
-    if ch.get("active") == 0 or "pw" in ch: c.execute("DELETE FROM sessions WHERE uid=?", (id,))
-    audit(c, h.user, "user_set", "user:%d" % id, ",".join(k if k in ("pw", "salt") is False else k for k in ch if k != "salt").replace("pw", "pw(changed)") if False else ",".join(k for k in ch if k not in ("salt", "pw")) + (" pw" if "pw" in ch else ""))
+    if ch.get("active") == 0 or "pw" in ch:
+        c.execute("DELETE FROM sessions WHERE uid=?", (id,)); c.execute("DELETE FROM devices WHERE uid=?", (id,))
+    audit(c, h.user, "user_set", "user:%d" % id, ",".join(k for k in ch if k not in ("salt", "pw")) + (" pw" if "pw" in ch else ""))
     return {"ok": 1}
 
 @route("GET", r"/api/audit", "audit")
@@ -373,7 +393,7 @@ table{width:100%;border-collapse:collapse;background:var(--card);border:1px soli
 .lv{padding:1px 7px;border-radius:9px;font-size:12px;color:#fff;background:#b54708}.lv.l2{background:#b42318}.lv.l3{background:#7a0c12}
 dialog{width:min(720px,94vw);max-height:90vh;overflow:auto;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px}dialog::backdrop{background:#0008}
 dl{display:grid;grid-template-columns:130px 1fr;gap:3px 12px;margin:0}dt{color:var(--mut)}dd{margin:0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
-.login{max-width:320px;margin:14vh auto;display:flex;flex-direction:column;gap:10px}
+.login{max-width:320px;margin:14vh auto;display:flex;flex-direction:column;gap:10px}.login input{display:block;width:100%;min-height:40px;box-sizing:border-box;cursor:text;user-select:text;-webkit-user-select:text}.login .pw{font-family:inherit;-webkit-text-security:disc;text-security:disc}
 </style><div id=app></div>
 <script>
 const E=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -387,12 +407,104 @@ async function api(p,m='GET',b){
  if(!r.ok)throw Error(j.error||r.status);return j}
 const T=f=>async(...a)=>{try{await f(...a)}catch(e){alert(e.message)}};
 const R=()=>go(cur,cx);
-function loginView(){$('#app').innerHTML=`<form class=login onsubmit="return false"><h2>Văn thư</h2><input id=u placeholder="Tên đăng nhập" autocomplete=username><input id=p type=password placeholder="Mật khẩu" autocomplete=current-password><button class=pri id=lb>Đăng nhập</button><p id=le class=od></p></form>`;
- const f=async()=>{try{await api('login','POST',{u:$('#u').value,p:$('#p').value});boot()}catch(e){$('#le').textContent=e.message}};$('#lb').onclick=f;$('#p').onkeydown=e=>e.key=='Enter'&&f()}
+function loginView(){
+ $('#app').innerHTML=`<form class="login" onsubmit="return false">
+   <h2>Văn thư</h2>
+
+   <input id="u"
+          type="text"
+          placeholder="Tên đăng nhập"
+          autocomplete="username"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false">
+
+   <input id="p"
+          type="text"
+          placeholder="Mật khẩu"
+          autocomplete="off"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
+          inputmode="text"
+          style="-webkit-text-security:disc;">
+
+   <button class="pri" id="lb" type="button">
+     Đăng nhập
+   </button>
+
+   <p id="le" class="od"></p>
+ </form>`;
+
+ const u=$('#u');
+ const p=$('#p');
+ const lb=$('#lb');
+ const le=$('#le');
+
+ p.disabled=false;
+ p.readOnly=false;
+
+ // Ép WebView cho phép nhập bàn phím
+ p.addEventListener('mousedown',function(e){
+   e.stopPropagation();
+   setTimeout(function(){
+     p.focus();
+   },0);
+ });
+
+ p.addEventListener('click',function(e){
+   e.stopPropagation();
+   p.focus();
+ });
+
+ p.addEventListener('touchstart',function(e){
+   e.stopPropagation();
+   setTimeout(function(){
+     p.focus();
+   },0);
+ },{passive:true});
+
+ const f=async function(){
+   if(lb.disabled)return;
+
+   try{
+     lb.disabled=true;
+     le.textContent='Đang đăng nhập...';
+
+     await api('login','POST',{
+       u:u.value,
+       p:p.value
+     });
+
+     boot();
+
+   }catch(e){
+     le.textContent=e.message||'Đăng nhập thất bại';
+   }finally{
+     lb.disabled=false;
+   }
+ };
+
+ lb.onclick=f;
+
+ p.addEventListener('keydown',function(e){
+   if(e.key==='Enter'){
+     e.preventDefault();
+     f();
+   }
+ });
+
+ u.addEventListener('keydown',function(e){
+   if(e.key==='Enter'){
+     e.preventDefault();
+     p.focus();
+   }
+ });
+}
 async function boot(){try{me=await api('me')}catch{return loginView()}
  [people,dos]=await Promise.all([api('people'),api('dossiers')]);
  $('#app').innerHTML=`<header><b>Văn thư</b><input id=q placeholder="Tìm số, trích yếu, nội dung… (không cần gõ dấu)"><span class=mut>${E(me.name)} · ${E(me.levels[me.level])}</span><button onclick="out()">Thoát</button></header><nav>${NAV.filter(n=>!n[2]||me.perms.includes(n[2])).map(n=>`<a id=n_${n[0]} onclick="go('${n[0]}')">${n[1]}</a>`).join('')}</nav><main id=m></main><dialog id=dg></dialog>`;
- $('#q').onkeydown=e=>e.key=='Enter'&&$('#q').value.trim()&&go('s',$('#q').value);go('dash');setInterval(()=>cur=='dash'&&!$('#dg').open&&go('dash'),60000)}
+ $('#q').onkeydown=e=>e.key=='Enter'&&$('#q').value.trim()&&go('s',$('#q').value);if(window.AndroidApp&&!AndroidApp.has())api('device','POST',{}).then(r=>AndroidApp.token(r.token)).catch(()=>{});go('dash');setInterval(()=>cur=='dash'&&!$('#dg').open&&go('dash'),60000)}
 const out=T(async()=>{await api('logout','POST',{});loginView()});
 const go=T(async(t,x)=>{cur=t;cx=x;document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.id=='n_'+(t=='s'?'':t)));
  await({dash,den:()=>lst('den'),di:()=>lst('di'),s:()=>lst('',x),dos:dview,audit:aview,users:uview}[t])()});
@@ -400,15 +512,15 @@ const cls=x=>x<0?'od':x<=1?'d1':x<=3?'d3':x<=7?'d7':'';
 async function dash(){const d=await api('dash'),n=(k,s)=>d.stats.filter(r=>r.kind==k&&r.status==s).reduce((a,r)=>a+r.n,0);
  $('#m').innerHTML=`<div class=cards><div class=card><b>${n('den','Mới')}</b>Văn bản đến mới</div><div class=card><b>${n('den','Đang xử lý')}</b>Đến đang xử lý</div><div class=card><b>${n('di','Chờ duyệt')}</b>Đi chờ duyệt</div><div class="card od"><b>${d.tasks.filter(t=>t.days<0).length}</b>Việc quá hạn</div></div>
  <h3>Việc cần làm</h3>${d.tasks.map(t=>`<div class="row ${cls(t.days)}" onclick="view(${t.doc_id})"><span>${E(t.title)}<small class=mut> — ${E(t.so_kh||t.trichyeu)} · ${E(t.an||'')}</small></span><b>${t.days<0?'Quá hạn '+(-t.days)+' ngày':t.days==0?'Hôm nay':'Còn '+t.days+' ngày'} · ${vd(t.due)}</b></div>`).join('')||'<p class=mut>Không có việc đang chờ.</p>'}`}
-const rows=r=>r.length?`<table><tr><th>Số<th>Số/ký hiệu<th>Ngày VB<th>Trích yếu<th>Cơ quan<th>Hạn<th>Trạng thái</tr>${r.map(d=>`<tr onclick="view(${d.id})"><td>${d.kind=='den'?'Đến':'Đi'} ${d.reg_no}/${d.reg_year}<td>${E(d.so_kh)}<td>${vd(d.ngay_vb)}<td>${d.level?`<span class="lv l${d.level}">${E(me.levels[d.level])}</span> `:''}${d.urgency!='Thường'?`<b class=od>${E(d.urgency)}</b> `:''}${E(d.trichyeu)}<td>${E(d.coquan)}<td>${vd(d.due)}<td>${E(d.status)}</tr>`).join('')}</table>`:'<p class=mut>Không có văn bản.</p>';
+const rows=r=>r.length?`<table><tr><th>Số<th>Số/ký hiệu<th>Ngày VB<th>Trích yếu<th>Cơ quan<th>Hạn<th>Tệp<th>Trạng thái</tr>${r.map(d=>`<tr onclick="view(${d.id})"><td>${d.kind=='den'?'Đến':'Đi'} ${d.reg_no}/${d.reg_year}<td>${E(d.so_kh)}<td>${vd(d.ngay_vb)}<td>${d.level?`<span class="lv l${d.level}">${E(me.levels[d.level])}</span> `:''}${d.urgency!='Thường'?`<b class=od>${E(d.urgency)}</b> `:''}${E(d.trichyeu)}<td>${E(d.coquan)}<td>${vd(d.due)}<td>${d.file_count?`<b>${d.file_count}</b> tệp`:'—'}<td>${E(d.status)}</tr>`).join('')}</table>`:'<p class=mut>Không có văn bản.</p>';
 function lst(kind,q=''){const w=me.perms.includes('write')&&kind;
  $('#m').innerHTML=`<div class=bar><h2>${kind=='den'?'Văn bản đến':kind=='di'?'Văn bản đi':'Kết quả tìm kiếm'}</h2><select id=fs onchange=ld()><option value=''>Mọi trạng thái${[...new Set([...ST.den,...ST.di])].map(s=>`<option>${s}`).join('')}</select> Từ <input type=date id=ff onchange=ld()> đến <input type=date id=ft onchange=ld()>${w?`<button class=pri onclick="form('${kind}')">+ Đăng ký mới</button>`:''}</div><div id=res></div>`;
  window.ld=T(async()=>{$('#res').innerHTML=rows(await api('docs?'+new URLSearchParams({kind,q,status:$('#fs').value,from:$('#ff').value,to:$('#ft').value})))});ld()}
 const view=T(async id=>{const d=await api('docs/'+id),w=me.perms.includes('write'),asg=me.perms.includes('assign'),ro=d.status=='Lưu trữ',f=(l,v)=>`<dt>${l}<dd>${E(v)||'—'}`;
  $('#dg').innerHTML=`<h3>${d.kind=='den'?'Văn bản đến':'Văn bản đi'} số ${d.reg_no}/${d.reg_year}</h3><p><b>${E(d.trichyeu)}</b></p><dl>${f('Số/ký hiệu',d.so_kh)}${f('Ngày văn bản',vd(d.ngay_vb))}${f('Ngày đến',vd(d.ngay_den))}${f(d.kind=='den'?'Cơ quan gửi':'Nơi nhận',d.coquan)}${f('Người ký',d.nguoiky)}${f('Mức độ mật',me.levels[d.level])}${f('Độ khẩn',d.urgency)}${f('Hồ sơ',d.dossier)}</dl>
  <p>Trạng thái: ${w?`<select onchange="setSt(${id},this.value)">${ST[d.kind].map(s=>`<option${s==d.status?' selected':''}>${s}`).join('')}</select> <button onclick="delDoc(${id})">Xóa</button>`:E(d.status)}</p>
- <h4>Tệp đính kèm</h4>${d.files.map(x=>`<div class=row style="cursor:default"><a href="/api/files/${x.id}">${E(x.name)}</a><small class=mut>v${x.ver} · ${(x.size/1024).toFixed(0)} KB · ${x.at.slice(0,10)}</small></div>`).join('')||'<p class=mut>Chưa có tệp.</p>'}
- ${w&&!ro?`<div class=bar><input type=file id=uf><button onclick="up(${id})">Tải lên</button></div>`:''}
+ <h4>Tệp đính kèm</h4>${d.files.map(x=>`<div class=row style="cursor:default"><a class=pri href="/api/files/${x.id}" download>${E(x.name)} · Tải xuống</a><small class=mut>v${x.ver} · ${(x.size/1024).toFixed(0)} KB · ${x.at.slice(0,10)}</small></div>`).join('')||'<p class=mut>Chưa có tệp.</p>'}
+ ${w&&!ro?`<div class=bar><b>Tải tệp lên văn bản:</b><input type=file id=uf><button class=pri onclick="up(${id})">Tải lên</button></div>`:''}
  <h4>Nhiệm vụ</h4>${d.tasks.map(t=>`<div class="row ${t.done?'':cls((new Date(t.due)-new Date(new Date().toDateString()))/864e5)}" style="cursor:default"><span>${t.done?'✓ ':''}${E(t.title)}<small class=mut> — ${E(t.an||'')} · hạn ${vd(t.due)}</small></span>${!t.done&&(t.assignee==me.id||asg)?`<button onclick="done(${t.id},${id})">Hoàn thành</button>`:''}</div>`).join('')||'<p class=mut>Chưa có nhiệm vụ.</p>'}
  ${asg&&!ro?`<div class=bar><input id=tt placeholder="Nội dung việc"><select id=ta>${people.map(p=>`<option value=${p.id}>${E(p.name)}`).join('')}</select><input type=date id=td><button onclick="addT(${id})">Giao việc</button></div>`:''}
  <div class=bar><button onclick="$('#dg').close()">Đóng</button></div>`;if(!$('#dg').open)$('#dg').showModal()});

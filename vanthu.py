@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, doc_id INT, name TEXT, 
 CREATE TABLE IF NOT EXISTS texts(file_id INTEGER PRIMARY KEY, doc_id INT, txt TEXT);
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, doc_id INT, title TEXT, assignee INT, due TEXT, done INT DEFAULT 0, done_at TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts TEXT, uid INT, who TEXT, act TEXT, target TEXT, info TEXT, prev TEXT, h TEXT);
-CREATE TABLE IF NOT EXISTS devices(token_hash TEXT PRIMARY KEY, uid INT, at TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body);
 """
 
@@ -260,22 +259,6 @@ def dash(h):
     stats = [dict(r) for r in c.execute("SELECT kind,status,COUNT(*) n FROM docs WHERE deleted=0 AND level<=? GROUP BY kind,status", (u["level"],))]
     return {"tasks": tasks, "stats": stats}
 
-# ---- thiết bị di động: token chỉ đọc, chỉ dùng được cho /api/reminders (không truy cập được dữ liệu khác) ----
-@route("POST", r"/api/device")
-def dev_new(h):
-    tok = secrets.token_hex(32)
-    h.c.execute("INSERT INTO devices VALUES(?,?,?)", (hashlib.sha256(tok.encode()).hexdigest(), h.user["id"], now().isoformat(timespec="seconds")))
-    audit(h.c, h.user, "device_new"); return {"token": tok}
-
-@route("GET", r"/api/reminders", None)
-def reminders(h):   # chỉ trả số lượng, không trả tiêu đề/nội dung văn bản
-    m = re.fullmatch(r"Bearer ([0-9a-f]{64})", h.headers.get("Authorization", ""))
-    u = m and h.c.execute("SELECT u.* FROM devices d JOIN users u ON u.id=d.uid WHERE d.token_hash=? AND u.active=1", (hashlib.sha256(m[1].encode()).hexdigest(),)).fetchone()
-    need(u, 401, "Thiết bị chưa được cấp quyền")
-    days = [(date.fromisoformat(r[0]) - today()).days for r in h.c.execute(
-        "SELECT t.due FROM tasks t JOIN docs d ON d.id=t.doc_id AND d.deleted=0 WHERE t.done=0 AND t.assignee=? AND d.level<=?", (u["id"], u["level"]))]
-    return {"overdue": sum(x < 0 for x in days), "today": sum(x == 0 for x in days), "soon": sum(0 < x <= 3 for x in days)}
-
 @route("GET", r"/api/dossiers")
 def dos_list(h):
     return [dict(r) for r in h.c.execute("SELECT s.id,s.code,s.title,(SELECT COUNT(*) FROM docs d WHERE d.dossier_id=s.id AND d.deleted=0 AND d.level<=?) n FROM dossiers s ORDER BY s.id DESC", (h.user["level"],))]
@@ -316,9 +299,8 @@ def users_set(h, id):
         need(len(d["pw"]) >= 10, 400, "Mật khẩu tối thiểu 10 ký tự"); salt = secrets.token_hex(16); ch["salt"], ch["pw"] = salt, hpw(d["pw"], salt)
     need(ch, 400, "Không có thay đổi")
     c.execute("UPDATE users SET " + ",".join(k + "=?" for k in ch) + " WHERE id=?", (*ch.values(), id))
-    if ch.get("active") == 0 or "pw" in ch:
-        c.execute("DELETE FROM sessions WHERE uid=?", (id,)); c.execute("DELETE FROM devices WHERE uid=?", (id,))
-    audit(c, h.user, "user_set", "user:%d" % id, ",".join(k for k in ch if k not in ("salt", "pw")) + (" pw" if "pw" in ch else ""))
+    if ch.get("active") == 0 or "pw" in ch: c.execute("DELETE FROM sessions WHERE uid=?", (id,))
+    audit(c, h.user, "user_set", "user:%d" % id, ",".join(k if k in ("pw", "salt") is False else k for k in ch if k != "salt").replace("pw", "pw(changed)") if False else ",".join(k for k in ch if k not in ("salt", "pw")) + (" pw" if "pw" in ch else ""))
     return {"ok": 1}
 
 @route("GET", r"/api/audit", "audit")
@@ -410,7 +392,7 @@ function loginView(){$('#app').innerHTML=`<form class=login onsubmit="return fal
 async function boot(){try{me=await api('me')}catch{return loginView()}
  [people,dos]=await Promise.all([api('people'),api('dossiers')]);
  $('#app').innerHTML=`<header><b>Văn thư</b><input id=q placeholder="Tìm số, trích yếu, nội dung… (không cần gõ dấu)"><span class=mut>${E(me.name)} · ${E(me.levels[me.level])}</span><button onclick="out()">Thoát</button></header><nav>${NAV.filter(n=>!n[2]||me.perms.includes(n[2])).map(n=>`<a id=n_${n[0]} onclick="go('${n[0]}')">${n[1]}</a>`).join('')}</nav><main id=m></main><dialog id=dg></dialog>`;
- $('#q').onkeydown=e=>e.key=='Enter'&&$('#q').value.trim()&&go('s',$('#q').value);if(window.AndroidApp&&!AndroidApp.has())api('device','POST',{}).then(r=>AndroidApp.token(r.token)).catch(()=>{});go('dash');setInterval(()=>cur=='dash'&&!$('#dg').open&&go('dash'),60000)}
+ $('#q').onkeydown=e=>e.key=='Enter'&&$('#q').value.trim()&&go('s',$('#q').value);go('dash');setInterval(()=>cur=='dash'&&!$('#dg').open&&go('dash'),60000)}
 const out=T(async()=>{await api('logout','POST',{});loginView()});
 const go=T(async(t,x)=>{cur=t;cx=x;document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.id=='n_'+(t=='s'?'':t)));
  await({dash,den:()=>lst('den'),di:()=>lst('di'),s:()=>lst('',x),dos:dview,audit:aview,users:uview}[t])()});
